@@ -19,7 +19,7 @@
 
 ## D-03 API key 加密後存放在後端（方案 A）
 - **背景**：可以只存在瀏覽器（B），也可以加密存後端（A）。
-- **決定**：用 Fernet 加密後存入 `UserLLMKey.encrypted_key`，主密鑰放環境變數。另存 `last4` 供介面顯示；API 永遠不回傳完整 key；key 不進 log 與錯誤訊息，並有測試驗證。
+- **決定**：用 Fernet 加密後存入 `user_llm_keys.encrypted_key`，主密鑰放環境變數。另存 `last4` 供介面顯示；API 永遠不回傳完整 key；key 不進 log 與錯誤訊息，並有測試驗證。
 - **理由**：之後的 MCP 整合與背景重新規劃，都需要後端能自行呼叫 LLM；只存瀏覽器做不到。
 - **代價 / 之後**：資料庫與主密鑰同時外洩會暴露全部 key，兩者必須分開保管；主密鑰遺失則所有 key 失效，使用者需重填。之後換主密鑰可用 `MultiFernet` 輪替。
 
@@ -30,7 +30,7 @@
 
 ## D-05 第一版不做 dependency
 - **背景**：Milestone 之間或 Task 之間可能有依賴關係。
-- **決定**：v1 不做。順序暫由 `Milestone.week_index` 表達。
+- **決定**：v1 不做。順序暫由 `milestones.week_index` 表達。
 - **理由**：對「求職」這個場景夠用；先把核心流程做完。
 - **代價 / 之後**：要做時放在 Task 層（`TaskDependency`），roadmap 圖的 milestone 連線從 task 依賴推導，資料只存一份。必須檢查循環依賴，LLM 產出也要驗證這一點。
 
@@ -41,7 +41,7 @@
 - **代價 / 之後**：每次查詢要 `COUNT`。若出現效能問題，再考慮快取。
 
 ## D-07 刪除採 cascade
-- **決定**：刪 User 會帶走其 key 與 Goal；刪 Goal 會帶走 Milestone 與 Task（資料庫層 `ON DELETE CASCADE`）。
+- **決定**：刪 user 會帶走其 key 與 goal；刪 goal 會帶走 milestone 與 task（資料庫層 `ON DELETE CASCADE`，ORM 端搭配 `passive_deletes=True`）。
 - **理由**：計畫結構是樹狀的，子資料脫離父層沒有意義，避免孤兒資料。
 - **代價 / 之後**：誤刪無法復原。若需要，之後可改成軟刪除（`archived` 狀態或 `deleted_at`）。
 
@@ -56,16 +56,55 @@
 - **代價 / 之後**：索引稍大、除錯時較難讀；在此專案規模下影響可忽略。
 
 ## D-10 時間一律存 UTC
-- **決定**：所有時間欄位使用 timezone-aware 型別並以 UTC 存放，顯示時才轉成使用者時區。
+- **決定**：所有時間欄位使用 timezone-aware 型別（`timestamptz`）並以 UTC 存放，顯示時才轉成使用者時區。
 - **理由**：避免時區與夏令時間造成的錯誤。
 
 ## D-11 `completed_at` 由 service 層統一維護
 - **決定**：status 變成 `done` 時寫入當下時間，離開 `done` 時清為 null；資料庫加 `CHECK ((status = 'done') = (completed_at IS NOT NULL))`。
 - **理由**：避免散落在各 endpoint 造成不一致；資料庫約束讓不合法的資料根本寫不進去。
+- **驗證**：已在資料庫用違規資料實測，確認會被拒絕。
+
+## D-12 預設值：`id` 與 `status` 放 Python 端，時間戳放資料庫端
+- **日期**：2026-11-11
+- **背景**：SQLAlchemy 的 `default` 在 Python 端生效，`server_default` 則寫進資料表定義。
+- **決定**：`id`（`uuid4`）與 `status` 用 `default=`；`created_at`、`updated_at` 用 `server_default=now()`。
+- **理由**：目前只有 app 會寫入資料庫；時間戳由資料庫決定，不受應用程式伺服器的時鐘影響。
+- **代價 / 之後**：直接寫 SQL 時，`id` 與 `status` 必須明確給值（實測時踩過）。`updated_at` 的更新由 ORM 的 `onupdate` 負責，直接用 SQL 更新不會自動變動。若之後有其他程式（如 MCP server）直接寫資料庫，應改為 `server_default` 或統一經過 service 層。
+
+## D-13 密碼雜湊使用 argon2
+- **日期**：2026-11-11
+- **決定**：使用 `argon2-cffi` 的 `PasswordHasher`。
+- **理由**：argon2 是記憶體密集型演算法，抗 GPU 暴力破解，是 OWASP 的首選建議；每次雜湊自帶隨機 salt。
+- **代價 / 之後**：比 bcrypt 稍吃資源，在此規模可忽略。`verify` 在密碼錯誤時丟例外，需在包裝函式中轉成回傳 `False`。
+
+## D-14 只用 access token，HS256，有效期 60 分鐘
+- **日期**：2026-11-11
+- **決定**：JWT 使用 HS256，簽章密鑰放環境變數；有效期 60 分鐘；payload 只放 `sub`（user id）與 `exp`；解碼時必須明確指定 `algorithms=[...]`；無效、被竄改或過期的 token 一律解碼為 `None`。
+- **理由**：先把核心流程做完。明確指定演算法可避免 token 自行指定演算法的經典漏洞。
+- **代價 / 之後**：token 被盜用前無法主動撤銷；沒有 refresh token，到期需重新登入。之後可加 refresh token。
+
+## D-15 登入失敗統一回覆「帳號或密碼錯誤」
+- **日期**：2026-11-11
+- **決定**：email 不存在與密碼錯誤使用相同的錯誤訊息與狀態碼。
+- **理由**：避免被用來探測哪些 email 已註冊。
+- **代價 / 之後**：使用者較難判斷自己錯在哪；註冊時的「email 已被使用」仍會洩漏帳號是否存在，之後可考慮改用 email 驗證流程處理。
+
+## D-16 email 小寫由應用層保證
+- **日期**：2026-11-11
+- **背景**：`users.email` 有 unique 約束，但資料庫以區分大小寫的方式比較，`A@test.com` 與 `a@test.com` 會被視為不同帳號。
+- **決定**：註冊與登入時，存入與查詢前一律轉小寫；資料庫不強制。
+- **理由**：實作簡單。
+- **代價 / 之後**：繞過 app 直接寫資料庫可能產生大小寫重複的帳號。若要由資料庫保證，可改用 Postgres 的 `citext` 型別，或對 `lower(email)` 建唯一索引。
+
+## D-17 保留 `user_llm_keys.user_id` 的獨立索引
+- **日期**：2026-11-11
+- **背景**：`UNIQUE (user_id, provider)` 建立的索引已涵蓋以 `user_id` 開頭的查詢，獨立的 `user_id` 索引嚴格來說重複。
+- **決定**：保留。
+- **理由**：此規模下多佔的空間與寫入成本可忽略；與其他外鍵欄位的做法一致，慣例統一；移除需要另外寫 migration。
+- **代價 / 之後**：每次寫入多維護一個索引。若資料量增大再評估移除。
 
 ---
 
 ## 待決定
 - `(goal_id, week_index)` 是否設 unique（是否允許同一週多個 milestone）
-- 密碼雜湊使用 argon2 還是 bcrypt
-- JWT 的有效期限與儲存方式（記憶體 / cookie）
+- JWT 在前端的儲存方式（記憶體 / cookie）
